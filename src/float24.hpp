@@ -1,128 +1,300 @@
-#ifndef FLOAT24_HPP
-#define FLOAT24_HPP
-
-// 本实现必须在小端CPU上运行，低字节存储在低地址
-#define IS_LITTLE_ENDIAN (*(uint16_t *)"\0\xff" < 0x100)
-
-#define CHOPMASK ((1UL << 24) - 1)
-#define F32_SIGN 0b10000000000000000000000000000000
-#define F32_EXP 0b01111111100000000000000000000000
-#define F32_MANT 0b00000000011111111111111111111111
-
-#define F24_SIGN 0b100000000000000000000000
-#define F24_EXP 0b011111100000000000000000
-#define F24_MANT 0b000000011111111111111111
-#define F24_NINF 0b111111100000000000000000
-#define F24_PINF 0b011111100000000000000000
-#define F24_NAN 0b111111111111111111111111
-#define F24_MANT_PREP 0b000000100000000000000000
-#define F24_EXP_CARRY 0b000001000000000000000000
-
-#define F32TOF24_SIGN 0b10000000000000000000000000000000
-#define F32TOF24_EXP 0b01111110000000000000000000000000
-#define F32TOF24_MANT 0b00000000011111111111111111000000
-#define F32TOF24_MANT_OFFSET 2
-
-#include <cmath>
-#include <cstring>
 #include <iostream>
+#include <cmath>
+#include <bitset>
+#include <string>
+#include <sstream>
 
+/** https://evanw.github.io/float-toy/
+保证精度都是float32的子集，因此float24可以安全转换为float32
+
+     1  符号位     sign
+     7   阶码  exponent
+    16   尾数  mantissa
+
+    精度: log_10⁡{(2^(16+1)} := 5.1175        (1-63=-62) 17位尾数精度为5.4
+    范围: -Infinity | -2*2^63 | -1*2^-62 | 0 | 1*2^-62 | 2*2^63 | +Infinity
+*/
 class Float24
 {
 private:
-    uint8_t value[3];
-    // 内存布局：0 1 2 三个字节按地址从低到高存储
-    // 字节对齐：一旦对齐 4 个字节，3 号字节存储在 2 号字节之后（最高地址）
-    // 小端字节序：低字节存储在低地址，因此当 value 指针强转为 uint32_t* 时，保证能够正确解释
+    using uint7_t = uint8_t; // 最高位不用，但运行时需保证运算时正确
+    uint8_t sign_exponent;   // 不能直接设置
+    uint16_t mantissa;       // 可以直接设置
 
-    uint32_t *value_as_uint32_ptr()
-    {
-        return (uint32_t *)value;
-    }
-    uint32_t value_as_uint32_safe(const uint8_t value[3])
-    { // 安全转换法
-        uint32_t result = 0;
-        if (IS_LITTLE_ENDIAN)
-        { // 小端
-            result |= value[0];
-            result |= value[1] << 8;
-            result |= value[2] << 16;
-        }
-        else
-        { // 大端
-            result |= value[2];
-            result |= value[1] << 8;
-            result |= value[0] << 16;
-        }
-        return result;
-    }
-
-    int8_t getExponent()
-    {
-        int8_t copy = (value[2] & 0b01111110);
-        copy >>= 1;
-        return copy - 31;
-    }
-
-    /** 牛顿迭代法 */
-    Float24 newtonDivision(Float24 guess, Float24 divider);
+    // 7bits 常量
+    static const uint7_t exponent_max = static_cast<uint8_t>(0b1111111);  // 127
+    static const uint7_t exponent_min = static_cast<uint8_t>(0b0000000);  // 0
+    static const uint7_t exponent_bias = static_cast<uint8_t>(0b0111111); // 63
 
 public:
-    Float24 operator+(Float24 f2);
-    Float24 operator-(Float24 f2);
-    Float24 operator-(); // 取反
-    Float24 operator/(Float24 f2);
-    Float24 operator*(Float24 f2);
-    bool operator==(Float24 f2);
-    void operator+=(Float24 f2);
-    void operator-=(Float24 f2);
-    void operator*=(Float24 f2);
-    void operator/=(Float24 f2);
-    bool equals(Float24 f2, int precision);
-    float toFloat32();
-    Float24(float number); // fromFloat32
-    static inline Float24 fromFloat32(float number) { return Float24(number); }
-    Float24() { std::memset(value, 0, 3); };
-    friend std::ostream &operator<<(std::ostream &cout, Float24 &obj);
+    // 无参构造器，返回的是：正零
+    explicit Float24() : sign_exponent(0), mantissa(0) {}
+    // 给定二进制构造
+    explicit Float24(bool sign, uint7_t exponent, uint16_t mantissa)
+    {
+        setSign(sign);
+        setExponent(exponent);
+        setMantissa(mantissa);
+    }
+    inline Float24 clone() const
+    {
+        Float24 f;
+        f.sign_exponent = sign_exponent;
+        f.mantissa = mantissa;
+        return f;
+    }
+
+    /** 0 为正，1 为负 */
+    bool inline getSign() const { return sign_exponent >> 7; }
+    uint16_t inline getMantissa() const { return mantissa; }
+    uint7_t inline getExponent() const { return sign_exponent & 0b01111111; } // 消除符号位即可
+
+    inline std::string toBinaryString() const
+    {
+        uint32_t n = mantissa;
+        n |= sign_exponent << 16;
+        return std::bitset<24>(n).to_string();
+    }
+    /** 返回二进制可读表示格式 */
+    inline std::string toPrettyString() const
+    {
+        std::string sign = getSign() ? "-" : "+";
+        if (isInfinity())
+            return sign + "Infinity";
+        if (isNaN())
+            return sign + "NaN";
+        std::stringstream ss;
+        ss << "(-1)^" << (int)(getSign()) << " * " << "2^(";
+        if (isDenormalized())
+        {
+            ss << "1-" << (int)(exponent_bias) << ")";
+            ss << " * " << "0.";
+            ss << std::bitset<16>(getMantissa()).to_string();
+        }
+        else
+        {
+            ss << (int)(getExponent()) << "-" << (int)exponent_bias << ")";
+            ss << " * " << "1.";
+            ss << std::bitset<16>(getMantissa()).to_string();
+        }
+        ss << " = " << toFloat();
+        return ss.str();
+    }
+
+    void inline setSign(bool sign)
+    {
+        if (getSign() == sign)
+            return;                  // 符号位相同，不改变
+        sign_exponent ^= 0b10000000; // 符号位取反
+    }
+    void inline setMantissa(uint16_t mantissa) { this->mantissa = mantissa; }
+    static void inline checkExponent(uint7_t exponent)
+    {
+        if (exponent & 0b10000000)
+            throw std::invalid_argument("exponent should be 7bits");
+    }
+    void inline setExponent(uint7_t exponent)
+    {
+        checkExponent(exponent);
+        sign_exponent &= 0b10000000; // 保留符号位
+        sign_exponent |= exponent;   // 设置阶码
+    }
+    /** @return 是否是 NaN */
+    bool inline isNaN() const
+    {
+        return getExponent() == exponent_max // 阶码全 1
+               && getMantissa() != 0;        // 尾数不为 0
+    }
+    /** @return 是否是静默 NaN */
+    bool inline isQNaN() const
+    {
+        return isNaN() && // 尾数最高位为 1
+               getMantissa() & 0b1000000000000000;
+    }
+    /** @return 是否是正负无穷大 */
+    bool inline isInfinity() const
+    {
+        return getExponent() == exponent_max // 阶码全 1
+               && getMantissa() == 0;        // 尾数为 0
+    }
+    /** @return 是否是正负零 */
+    bool inline isZero() const
+    {
+        return getExponent() == 0     // 阶码为 0
+               && getMantissa() == 0; // 尾数为 0
+    }
+    /** @return 是否是非规格化数 */
+    bool inline isDenormalized() const
+    {
+        return getExponent() == 0     // 阶码为 0
+               && getMantissa() != 0; // 尾数不为 0
+    }
+
+    /** @return Float24 正无限大，注意符号位为0 */
+    static Float24 inline infinity()
+    {
+        Float24 f;
+        f.setExponent(Float24::exponent_max);
+        return f;
+    }
+    /** @return 静默NaN */
+    static Float24 inline qNaN()
+    {
+        Float24 f;
+        f.setExponent(Float24::exponent_max);
+        f.setMantissa(0b1000000000000000); // 1 << 16
+        return f;
+    }
+
+    // 单精度浮点数转换为 Float24，注意会可能丢失精度
+    explicit Float24(float value)
+    {
+        uint32_t bits = *reinterpret_cast<uint32_t *>(&value);
+        bool sign = bits >> 31;
+        uint8_t exponent = (bits >> 23) & 0xFF; // 8 位阶码
+        uint32_t mantissa = bits & 0x7FFFFF;    // 23 位尾数
+
+        setSign(sign);
+
+        if (exponent == 0xFF)
+        { //  NaN or Infinity
+            setExponent(exponent_max);
+            setMantissa(mantissa ? 0xFFFF : 0);
+        }
+        else if (exponent == 0)
+        { // 单精度非规格化数，无法表示为 f24，故转化为 0
+            setExponent(0);
+            setMantissa(0);
+        }
+        else
+        {
+            // 127 为 f32 bias
+            int new_exponent = (int)exponent - 127 + (int)exponent_bias;
+            if (new_exponent >= (int)exponent_max)
+            { // 超过最大值，无法表示，故为 Infinity
+                setExponent(exponent_max);
+                setMantissa(0);
+            }
+            else if (new_exponent <= 0)
+            { // 超过最小值，无法表示，故为 0
+                setExponent(0);
+                setMantissa(0);
+            }
+            else
+            {
+                setExponent(new_exponent);
+                setMantissa(mantissa >> (23 - 16));
+            }
+        }
+    }
+
+    // 不会丢失精度
+    float toFloat() const
+    {
+        uint32_t sign = getSign() ? 1 : 0; // 1
+        uint32_t exponent = getExponent(); // 7
+        uint32_t mantissa = getMantissa(); // 16
+
+        if (exponent == exponent_max)
+        { // 转换正负 Infinity 或 NaN
+            exponent = 0xFF;
+            mantissa = mantissa ? 0x7FFFFF : 0;
+        }
+        else if (exponent == 0)
+        {
+            if (mantissa == 0)
+            { // 正负 0
+                exponent = 0;
+                mantissa = 0;
+            }
+            else
+            { // 非规格化数
+                while ((mantissa & (1 << 16)) == 0)
+                {
+                    mantissa <<= 1;
+                    exponent--;
+                }
+                mantissa &= ~(1 << 16); // 移除前导  1
+                exponent = 1;           // 非规格化数指数位为 1
+            }
+        }
+        else
+        {
+            exponent = exponent - exponent_bias + 127;
+            mantissa = mantissa << 7;
+        }
+        uint32_t bits = (sign << 31) | (exponent << 23) | mantissa;
+        return *reinterpret_cast<float *>(&bits);
+    }
+
+    Float24 operator+(const Float24 &other) const; // { return Float24(this->toFloat() + other.toFloat()); }
+    Float24 operator-(const Float24 &other) const; // { return Float24(this->toFloat() - other.toFloat()); }
+    Float24 operator*(const Float24 &other) const { return Float24(this->toFloat() * other.toFloat()); }
+    Float24 operator/(const Float24 &other) const { return Float24(this->toFloat() / other.toFloat()); }
 };
 
-Float24 Float24::operator+(Float24 f2)
+Float24 Float24::operator+(const Float24 &other) const
 {
-    uint32_t f1i = *(uint32_t *)value;
-    uint32_t f2i = *(uint32_t *)&f2;
-    uint32_t f_ret = 0;
-    f1i &= CHOPMASK;
-    f2i &= CHOPMASK;
+    // NaN + any = NaN
+    if (this->isNaN() || other.isNaN())
+        return qNaN();
 
-    if (f1i == 0)
-        return (*(Float24 *)&f2i);
-    else if (f2i == 0)
-        return (*(Float24 *)&f1i);
+    // 0 + any = any
+    if (this->isZero())
+        return other.clone();
+    if (other.isZero())
+        return this->clone();
 
-    uint32_t f1_sign = (f1i & F24_SIGN);
-    uint32_t f2_sign = (f2i & F24_SIGN);
-    int8_t f1_exp = getExponent();
-    int8_t f2_exp = f2.getExponent();
-    int8_t r_exp;
-    uint32_t f1_mant = (f1i & F24_MANT) | F24_MANT_PREP;
-    uint32_t f2_mant = (f2i & F24_MANT) | F24_MANT_PREP;
+    // Infinity + what = ?
+    static auto infPlusWhat = [&](Float24 inf, Float24 what) -> Float24
+    {
+        if (what.isInfinity())
+        {
+            if (inf.getSign() == what.getSign())
+                return Float24(inf);
+            return qNaN(); // 正无穷 + 负无穷 = NaN
+        }
+        else
+        {
+            return Float24(inf); // 否则，返回符号位不变的无穷
+        }
+    };
+
+    if (this->isInfinity())
+        return infPlusWhat(*this, other);
+    if (other.isInfinity())
+        return infPlusWhat(other, *this);
+
+    uint32_t f1_sign = this->getSign();
+    uint32_t f2_sign = other.getSign();
+    uint16_t f1_exp = this->getExponent();
+    uint16_t f2_exp = other.getExponent();
+    uint16_t r_exp;
+    uint32_t f1_mant = this->getMantissa();
+    uint32_t f2_mant = other.getMantissa();
+
+    // 对于规格化数，添加隐含的前导 1
+    if (f1_exp != 0)
+        f1_mant |= (1 << 16);
+    if (f2_exp != 0)
+        f2_mant |= (1 << 16);
 
     if (f1_exp > f2_exp)
-    {
-        f2_mant >>= std::abs(f1_exp - f2_exp);
+    { // 指数较小的那个浮点数的尾数向右移动
+        f2_mant >>= f1_exp - f2_exp;
         r_exp = f1_exp;
     }
     else
     {
+        f1_mant >>= f2_exp - f1_exp;
         r_exp = f2_exp;
-        f1_mant >>= std::abs(f2_exp - f1_exp);
     }
 
     uint32_t r_mant;
     uint32_t r_sign = f1_sign;
 
     if (f1_sign ^ f2_sign)
-    {
+    { // 符号位不同，减法
         if (f1_mant > f2_mant)
         {
             r_sign = f1_sign;
@@ -133,154 +305,35 @@ Float24 Float24::operator+(Float24 f2)
             r_mant = f2_mant - f1_mant;
             r_sign = f2_sign;
         }
-        else
-            return 0;
-        while (r_mant < 131072)
-        {
+        else // 抵消
+            return Float24(r_sign, 0, 0);
+
+        while (r_mant < (1 << 16) && r_exp > 0)
+        { // 对阶
             r_mant <<= 1;
             r_exp--;
         }
     }
     else
-    {
+    { // 符号位相同，加法
         r_mant = f1_mant + f2_mant;
-        if (r_mant & F24_EXP_CARRY)
+        if (r_mant & (1 << 17))
         {
             r_mant >>= 1;
             r_exp++;
         }
     }
 
-    f_ret |= (r_mant & F24_MANT);
-    f_ret |= (r_exp + 31) << 17;
-    f_ret |= r_sign;
-    return (*(Float24 *)&f_ret);
+    // 对于规格化数，移除前导 1
+    if (r_exp != 0)
+        r_mant &= ~(1 << 16);
+
+    return Float24(r_sign, r_exp, r_mant);
 }
 
-Float24 Float24::operator-(Float24 f2)
+Float24 Float24::operator-(const Float24 &other) const
 {
-    *(uint32_t *)&f2 ^= 1UL << 23;
-    return *this + f2;
+    Float24 neg_other = other.clone();
+    neg_other.setSign(!other.getSign());
+    return *this + neg_other;
 }
-
-Float24 Float24::operator-()
-{
-    *(uint32_t *)this ^= F24_SIGN;
-    return *this;
-}
-
-Float24 Float24::operator/(Float24 f2)
-{
-    if (*(uint32_t *)&f2 & F24_SIGN)
-        return *this * -newtonDivision(0.1f, -f2);
-    return *this * newtonDivision(0.1f, f2);
-}
-
-Float24 Float24::operator*(Float24 f2)
-{
-    uint32_t f1i = *(uint32_t *)value;
-    uint32_t f2i = *(uint32_t *)&f2;
-    uint32_t f_ret = 0;
-    f1i &= CHOPMASK;
-    f2i &= CHOPMASK;
-
-    if (f1i == 0 || f2i == 0)
-        return 0;
-
-    uint32_t f1_sign = (f1i & F24_SIGN);
-    uint32_t f2_sign = (f2i & F24_SIGN);
-    uint32_t r_sign = f1_sign ^ f2_sign;
-    int8_t f1_exp = getExponent();
-    int8_t f2_exp = f2.getExponent();
-    uint32_t f1_mant = (f1i & F24_MANT);
-    uint32_t f2_mant = (f2i & F24_MANT);
-    uint64_t r_mant;
-    int8_t r_exp = f1_exp + f2_exp;
-    if (f2_mant == 0)
-        r_mant = f1_mant;
-    else
-    {
-        uint64_t t = f1_mant | F24_MANT_PREP;
-        uint64_t t2 = f2_mant | F24_MANT_PREP;
-        r_mant = t * t2;
-        r_mant >>= 17;
-        if (r_mant & F24_EXP_CARRY)
-        {
-            r_mant >>= 1;
-            r_exp++;
-        }
-    }
-    if (r_exp > 31)
-        return F24_PINF;
-    if (r_exp < -32)
-        return 0;
-    f_ret |= (r_mant & F24_MANT);
-    f_ret |= (((uint32_t)r_exp + 31) << 17) & F24_EXP;
-    f_ret |= r_sign;
-    return (*(Float24 *)&f_ret);
-}
-
-bool Float24::operator==(Float24 f2) { return *(uint32_t *)this == *(uint32_t *)&f2; }
-
-void Float24::operator+=(Float24 f2) { *this = *this + f2; }
-
-void Float24::operator-=(Float24 f2) { *this = *this - f2; }
-
-void Float24::operator/=(Float24 f2) { *this = *this / f2; }
-
-void Float24::operator*=(Float24 f2) { *this = *this * f2; }
-
-bool Float24::equals(Float24 f2, int precision)
-{
-    Float24 copy = *this;
-    Float24 delta = copy - f2;
-    return delta.getExponent() <= -(precision * 4);
-}
-
-Float24::Float24(float number)
-{
-    std::memset(value, 0, 3);
-    uint32_t *f32 = (uint32_t *)&number;
-    uint32_t *f24i = (uint32_t *)value;
-    uint32_t sign = *f32 & F32_SIGN;
-    int32_t exp = ((*f32 & F32_EXP) >> 23) - 127 + 31; // 128 half of int8, 32 half of int6
-    if (exp == -96)                                    // handle float point zero on exponent 00000000 -> -128
-        exp = 0;
-    uint32_t mant = *f32 & F32_MANT;
-    *f24i |= sign >> 8;
-    *f24i |= exp << 17;
-    *f24i |= ((mant & F32TOF24_MANT) << F32TOF24_MANT_OFFSET) >> 8;
-}
-
-Float24 Float24::newtonDivision(Float24 guess, Float24 divider)
-{
-    for (int i = 0; i < 10; ++i)
-    {
-        guess = guess * (Float24(2) - divider * guess);
-    }
-    return guess;
-}
-
-float Float24::toFloat32()
-{
-    float result = 0;
-    uint32_t *f32 = (uint32_t *)&result;
-    uint32_t f24i = *(uint32_t *)value;
-    f24i &= CHOPMASK;
-    if (f24i == 0)
-        return 0;
-    *f32 |= (f24i & F24_SIGN) >> 8;
-    int8_t ex = getExponent();
-    *f32 |= (ex + 127) << 7;
-    *f32 <<= 16;
-    *f32 |= (f24i & F24_MANT) << 6;
-    return result;
-}
-
-std::ostream &operator<<(std::ostream &cout, Float24 &obj)
-{
-    cout << obj.toFloat32();
-    return cout;
-}
-
-#endif

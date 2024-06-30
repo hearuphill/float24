@@ -30,7 +30,7 @@ Float24 applyOp(Float24 a, Float24 b, char op)
     case '*':
         return a * b;
     case '/':
-        if (b == Float24(0.0))
+        if (b.isZero())
         {
             throw std::invalid_argument("Division by zero");
         }
@@ -150,7 +150,7 @@ int main()
         try
         {
             Float24 result = evaluate(line);
-            std::cout << "Result: " << result.toFloat32() << std::endl;
+            std::cout << "Result: " << result.toFloat() << std::endl;
         }
         catch (const std::exception &e)
         {
@@ -160,5 +160,3 @@ int main()
 
     return 0;
 }
-
- 
